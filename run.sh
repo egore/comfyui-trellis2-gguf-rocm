@@ -10,7 +10,7 @@ pip install --upgrade comfy-cli onnxruntime
 comfy update
 
 # ROCm / gfx1102 (RX 7600 XT) runtime settings
-export HSA_OVERRIDE_GFX_VERSION=11.0.0        # Needed for gfx1102 compatibility with some ROCm libs
+# export HSA_OVERRIDE_GFX_VERSION=11.0.0        # Needed for gfx1102 compatibility with ROCm 6.x
 export ATTN_BACKEND=sdpa                       # Force PyTorch SDPA — reliable on ROCm (avoids flash_attn/xformers issues)
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 

@@ -269,6 +269,15 @@ echo -e "${green}:::::::::::::: Building ${yellow}FlexGEMM${green} from source (
 if [ -d "${TMPBUILD}/FlexGEMM" ]; then rm -rf "${TMPBUILD}/FlexGEMM"; fi
 git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git "${TMPBUILD}/FlexGEMM"
 $PYTHON_EXE -m pip install "${TMPBUILD}/FlexGEMM" --no-build-isolation $PIPargs
+# Patch FlexGEMM Triton config: disable TF32 on ROCm (NVIDIA-only precision format)
+FLEX_SPCONV_CFG="${SITE_PACKAGES}/flex_gemm/kernels/triton/spconv/config.py"
+if [ -f "$FLEX_SPCONV_CFG" ]; then
+    sed -i '1s/^/import torch\n/' "$FLEX_SPCONV_CFG"
+    sed -i 's/^allow_tf32 = True$/# TF32 is NVIDIA-only. On ROCm, Triton only supports ieee\/bf16x3\/bf16x6.\nallow_tf32 = not getattr(torch.version, "hip", None)/' "$FLEX_SPCONV_CFG"
+    echo -e "${green}Patched FlexGEMM: disabled TF32 on ROCm${reset}"
+fi
+# Clear stale Triton compilation cache
+rm -rf ~/.triton/cache 2>/dev/null
 echo ""
 
 # --- o-voxel (builds with HIP via TRELLIS.2 source) ---

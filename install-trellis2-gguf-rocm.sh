@@ -454,6 +454,13 @@ $PYTHON_EXE -m pip install --upgrade pooch --no-deps $PIPargs
 echo -e "${green}Checking numpy version...${reset}"
 $PYTHON_EXE -c "import numpy; print(f'numpy {numpy.__version__} installed')"
 
+# ---- Patch Trellis2 GGUF plugin: use OpenGL rasterizer instead of CUDA (ROCm) ----
+TRELLIS_PLUGIN="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2-GGUF"
+if [ -d "$TRELLIS_PLUGIN" ]; then
+    echo -e "${green}:::::::::::::: Patching ${yellow}Trellis2 GGUF${green}: RasterizeCudaContext → RasterizeGLContext${reset}"
+    find "$TRELLIS_PLUGIN" -name '*.py' -exec sed -i 's/RasterizeCudaContext/RasterizeGLContext/g' {} +
+fi
+
 # ---- Cleanup ----
 echo ""
 echo -e "${green}Cleaning up build temp files...${reset}"

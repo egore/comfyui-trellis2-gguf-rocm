@@ -21,6 +21,7 @@ reset='\033[0m'
 # ---- Locate Python from comfy-env venv ----
 COMFY_ROOT="$(pwd)"
 VENV_DIR="${COMFY_ROOT}/comfy-env"
+COMFYUI_DIR="${COMFY_ROOT}/ComfyUI"
 PYTHON_EXE=""
 
 if [ -x "${VENV_DIR}/bin/python" ]; then

@@ -306,12 +306,14 @@ else
 fi
 echo ""
 
-# --- nvdiffrast (patched for ROCm/HIP) ---
-echo -e "${green}:::::::::::::: Building ${yellow}nvdiffrast${green} from source (ROCm)${reset}"
+# --- nvdiffrast v0.4.0 (patched for ROCm/HIP) ---
+# Builds interpolate/texture/antialias ops with HIP. The CUDA rasterizer is
+# stubbed out because CudaRaster uses PTX inline assembly.
+echo -e "${green}:::::::::::::: Building ${yellow}nvdiffrast v0.4.0${green} from source (ROCm)${reset}"
 if [ -d "${TMPBUILD}/nvdiffrast" ]; then rm -rf "${TMPBUILD}/nvdiffrast"; fi
 git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git "${TMPBUILD}/nvdiffrast"
 
-echo -e "${yellow}Applying ROCm patches to nvdiffrast...${reset}"
+echo -e "${yellow}Applying ROCm patches to nvdiffrast v0.4.0...${reset}"
 NVDR="${TMPBUILD}/nvdiffrast"
 
 # 1) __frcp_rz is CUDA-only; replace with 1.0f/x which compiles on both
@@ -331,7 +333,6 @@ sed -i 's/"-lineinfo"//g' "${NVDR}/setup.py"
 
 # 4) The cudaraster module uses NVIDIA PTX inline assembly and cannot be ported to HIP.
 #    Remove cudaraster sources AND torch_rasterize (deeply coupled to CudaRaster internals).
-#    The OpenGL rasterize path (nvdiffrast.torch.RasterizeGLContext) still works.
 sed -i '/cudaraster\/impl\/Buffer.cpp/d' "${NVDR}/setup.py"
 sed -i '/cudaraster\/impl\/CudaRaster.cpp/d' "${NVDR}/setup.py"
 sed -i '/cudaraster\/impl\/RasterImpl.cpp/d' "${NVDR}/setup.py"
@@ -339,8 +340,6 @@ sed -i '/cudaraster\/impl\/RasterImpl_kernel.cu/d' "${NVDR}/setup.py"
 sed -i '/torch_rasterize/d' "${NVDR}/setup.py"
 
 # 4b) Create stub rasterize implementations so torch_bindings links successfully.
-#     torch_types.h already declares RasterizeCRStateWrapper — we just provide the implementations.
-#     These throw at runtime — only the OpenGL rasterize path works on ROCm.
 cat > "${NVDR}/csrc/torch/torch_rasterize_stub.cu" << 'STUBEOF'
 #include "torch_common.inl"
 #include "torch_types.h"
@@ -358,15 +357,12 @@ STUBEOF
 sed -i '/torch_bindings/a\                "csrc/torch/torch_rasterize_stub.cu",' "${NVDR}/setup.py"
 
 # 5) Patch framework.h to use HIP includes on ROCm.
-#    The original has #ifndef __CUDACC__ guards and NVDR_CHECK macros we must preserve.
 cat > "${NVDR}/csrc/common/framework.h" << 'FWEOF'
 #pragma once
 
 #ifdef NVDR_TORCH
 
 #if defined(__HIP_PLATFORM_AMD__)
-// ROCm/HIP path — no __HIPCC__ guard because we renamed .cpp→.cu
-// and these files need full torch headers even under hipcc
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/HIPUtils.h>
@@ -375,7 +371,6 @@ cat > "${NVDR}/csrc/common/framework.h" << 'FWEOF'
 #define NVDR_CHECK(COND, ERR) do { TORCH_CHECK(COND, ERR) } while(0)
 #define NVDR_CHECK_CUDA_ERROR(HIP_CALL) do { hipError_t err = HIP_CALL; TORCH_CHECK(!err, "HIP error: ", hipGetErrorString(hipGetLastError()), "[", #HIP_CALL, ";]"); } while(0)
 #else
-// CUDA path (original)
 #ifndef __CUDACC__
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -391,11 +386,9 @@ cat > "${NVDR}/csrc/common/framework.h" << 'FWEOF'
 FWEOF
 
 # 6) Fix narrowing conversion error in torch_antialias.cpp (clang is stricter than nvcc)
-#    Must be done BEFORE the .cpp→.cu rename below
 sed -i 's/(uint64_t)p\.allocTriangles/(int64_t)p.allocTriangles/g' "${NVDR}/csrc/torch/torch_antialias.cpp"
 
 # 7) Rename .cpp files to .cu so they get compiled with hipcc
-#    (hipcc provides the CUDA-to-HIP header mapping layer that c++ doesn't have)
 for f in torch_antialias torch_bindings torch_interpolate torch_texture; do
     if [ -f "${NVDR}/csrc/torch/${f}.cpp" ]; then
         mv "${NVDR}/csrc/torch/${f}.cpp" "${NVDR}/csrc/torch/${f}.cu"
@@ -410,7 +403,275 @@ for f in common texture; do
 done
 
 $PYTHON_EXE -m pip install "${NVDR}" --no-build-isolation $PIPargs || \
-    echo -e "${warning}WARNING: nvdiffrast build failed. Some rendering features may not work.${reset}"
+    echo -e "${warning}WARNING: nvdiffrast v0.4.0 build failed. Some rendering features may not work.${reset}"
+echo ""
+
+# --- nvdiffrast GL plugin from v0.3.5 ---
+# v0.4.0 removed the OpenGL rasterizer. We build the GL plugin from v0.3.5 sources
+# as a separate extension module, then patch ops.py to load it for RasterizeGLContext.
+# The GL plugin uses EGL for headless OpenGL and HIP-GL interop for buffer sharing.
+echo -e "${green}:::::::::::::: Building ${yellow}nvdiffrast GL plugin${green} from v0.3.5 sources${reset}"
+if [ -d "${TMPBUILD}/nvdiffrast_gl" ]; then rm -rf "${TMPBUILD}/nvdiffrast_gl"; fi
+git clone -b v0.3.5 https://github.com/NVlabs/nvdiffrast.git "${TMPBUILD}/nvdiffrast_gl"
+
+NVDR_GL="${TMPBUILD}/nvdiffrast_gl/nvdiffrast"
+NVDR_INSTALLED="${SITE_PACKAGES}/nvdiffrast"
+
+echo -e "${yellow}Patching v0.3.5 GL sources for ROCm/HIP...${reset}"
+
+# Patch common.cpp: replace cuda_runtime.h with hip equivalent
+sed -i 's|#include <cuda_runtime.h>|#if defined(__HIP_PLATFORM_AMD__)\n#include <hip/hip_runtime.h>\n#else\n#include <cuda_runtime.h>\n#endif|' "${NVDR_GL}/common/common.cpp"
+
+# Patch common.h: replace cuda.h with hip equivalent
+sed -i 's|#include <cuda.h>|#if defined(__HIP_PLATFORM_AMD__)\n#include <hip/hip_runtime.h>\n#else\n#include <cuda.h>\n#endif|' "${NVDR_GL}/common/common.h"
+
+# Patch glutil.h: replace cuda_gl_interop.h with hip_gl_interop.h on ROCm
+# hip_gl_interop.h requires hip_runtime.h for type definitions (hipError_t etc.)
+sed -i 's|#include <cuda_gl_interop.h>|#if defined(__HIP_PLATFORM_AMD__)\n#include <hip/hip_runtime.h>\n#include <hip/hip_gl_interop.h>\n#else\n#include <cuda_gl_interop.h>\n#endif|' "${NVDR_GL}/common/glutil.h"
+
+# Patch framework.h for ROCm/HIP — must match v0.3.5 macro definitions exactly.
+# On ROCm, we include HIP runtime and provide CUDA→HIP type aliases so that the
+# original nvdiffrast GL sources compile without modification.
+cat > "${NVDR_GL}/common/framework.h" << 'FWGLEOF'
+#pragma once
+
+#ifdef NVDR_TORCH
+
+#if defined(__HIP_PLATFORM_AMD__)
+// ROCm/HIP path — provide CUDA→HIP type aliases for the GL plugin sources
+#include <hip/hip_runtime.h>
+
+// CUDA→HIP type aliases
+typedef hipStream_t                 cudaStream_t;
+typedef hipError_t                  cudaError_t;
+typedef hipGraphicsResource_t       cudaGraphicsResource_t;
+
+// CUDA→HIP constant aliases
+#define cudaSuccess                 hipSuccess
+#define cudaMemcpyDeviceToDevice    hipMemcpyDeviceToDevice
+#define cudaGraphicsRegisterFlagsWriteDiscard hipGraphicsRegisterFlagsWriteDiscard
+
+// CUDA→HIP function aliases
+#define cudaGraphicsGLRegisterBuffer    hipGraphicsGLRegisterBuffer
+#define cudaGraphicsMapResources        hipGraphicsMapResources
+#define cudaGraphicsUnmapResources      hipGraphicsUnmapResources
+#define cudaGraphicsResourceGetMappedPointer hipGraphicsResourceGetMappedPointer
+#define cudaGraphicsUnregisterResource  hipGraphicsUnregisterResource
+#define cudaMemcpyAsync                 hipMemcpyAsync
+#define cudaDeviceSynchronize           hipDeviceSynchronize
+#define cudaDeviceGetAttribute          hipDeviceGetAttribute
+#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#define cudaDeviceGetPCIBusId           hipDeviceGetPCIBusId
+#define cudaGraphicsSubResourceGetMappedArray hipGraphicsSubResourceGetMappedArray
+#define cudaArrayGetInfo                hipArrayGetInfo
+typedef hipArray_t                      cudaArray_t;
+typedef hipChannelFormatDesc            cudaChannelFormatDesc;
+typedef hipExtent                       cudaExtent;
+#define cudaChannelFormatKindFloat      hipChannelFormatKindFloat
+#define cudaMemcpy3DParms               hipMemcpy3DParms
+#define cudaMemcpy3DAsync               hipMemcpy3DAsync
+#define cudaGraphicsGLRegisterImage     hipGraphicsGLRegisterImage
+#define cudaGraphicsRegisterFlagsReadOnly hipGraphicsRegisterFlagsReadOnly
+
+#include <torch/extension.h>
+#include <c10/hip/HIPStream.h>
+#include <c10/hip/HIPGuard.h>
+#include <pybind11/numpy.h>
+
+// at::cuda namespace aliases for ROCm
+namespace at { namespace cuda {
+    using c10::cuda::OptionalCUDAGuard;
+    inline c10::cuda::CUDAStream getCurrentCUDAStream(c10::DeviceIndex device_index = -1) {
+        return c10::hip::getCurrentHIPStream(device_index);
+    }
+    inline bool check_device(c10::ArrayRef<at::Tensor> ts) {
+        if (ts.empty()) return true;
+        at::Device curDevice = ts.front().device();
+        for (const at::Tensor& t : ts) { if (t.device() != curDevice) return false; }
+        return true;
+    }
+}}
+#else
+// CUDA path (original)
+#ifndef __CUDACC__
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAUtils.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <pybind11/numpy.h>
+#endif
+#endif
+
+#define NVDR_CTX_ARGS int _nvdr_ctx_dummy
+#define NVDR_CTX_PARAMS 0
+#define NVDR_CHECK(COND, ERR) do { TORCH_CHECK(COND, ERR) } while(0)
+#define NVDR_CHECK_GL_ERROR(GL_CALL) do { GL_CALL; GLenum err = glGetError(); TORCH_CHECK(err == GL_NO_ERROR, "OpenGL error: ", getGLErrorString(err), "[", #GL_CALL, ";]"); } while(0)
+
+#if defined(__HIP_PLATFORM_AMD__)
+#define NVDR_CHECK_CUDA_ERROR(CALL) do { hipError_t err = CALL; TORCH_CHECK(!err, "HIP error: ", hipGetErrorString(err), "[", #CALL, ";]"); } while(0)
+#else
+#define NVDR_CHECK_CUDA_ERROR(CUDA_CALL) do { cudaError_t err = CUDA_CALL; TORCH_CHECK(!err, "Cuda error: ", cudaGetLastError(), "[", #CUDA_CALL, ";]"); } while(0)
+#endif
+
+#endif // NVDR_TORCH
+FWGLEOF
+
+# Build GL plugin as CppExtension (NOT CUDAExtension to avoid hipify mangling).
+# framework.h provides all CUDA→HIP type/function aliases, so hipcc's auto-mapping
+# is not needed. We just need the ROCm include path for hip_runtime.h.
+cat > "${TMPBUILD}/nvdiffrast_gl/setup_gl.py" << 'GLSETUPEOF'
+import os
+from setuptools import setup
+from torch.utils.cpp_extension import CppExtension, BuildExtension
+
+nvdr_dir = os.path.join(os.path.dirname(__file__), 'nvdiffrast')
+
+# Find ROCm include path
+rocm_include = '/opt/rocm/include'
+if not os.path.isdir(rocm_include):
+    rocm_include = os.environ.get('ROCM_PATH', '/opt/rocm') + '/include'
+
+setup(
+    name='nvdiffrast_plugin_gl',
+    ext_modules=[
+        CppExtension(
+            name='nvdiffrast_plugin_gl',
+            sources=[
+                os.path.join(nvdr_dir, 'common', 'common.cpp'),
+                os.path.join(nvdr_dir, 'common', 'glutil.cpp'),
+                os.path.join(nvdr_dir, 'common', 'rasterize_gl.cpp'),
+                os.path.join(nvdr_dir, 'torch', 'torch_bindings_gl.cpp'),
+                os.path.join(nvdr_dir, 'torch', 'torch_rasterize_gl.cpp'),
+            ],
+            include_dirs=[
+                os.path.join(nvdr_dir, 'common'),
+                os.path.join(nvdr_dir, 'torch'),
+                rocm_include,
+            ],
+            define_macros=[('NVDR_TORCH', None), ('__HIP_PLATFORM_AMD__', '1')],
+            libraries=['GL', 'EGL', 'amdhip64'],
+            library_dirs=['/opt/rocm/lib'],
+        ),
+    ],
+    cmdclass={'build_ext': BuildExtension},
+)
+GLSETUPEOF
+
+echo -e "${yellow}Building GL plugin extension...${reset}"
+cd "${TMPBUILD}/nvdiffrast_gl"
+$PYTHON_EXE setup_gl.py build_ext --inplace 2>&1
+GL_SO=$(find "${TMPBUILD}/nvdiffrast_gl" -name 'nvdiffrast_plugin_gl*.so' -type f | head -1)
+if [ -n "$GL_SO" ]; then
+    cp "$GL_SO" "${SITE_PACKAGES}/"
+    echo -e "${green}GL plugin built and installed: $(basename $GL_SO)${reset}"
+else
+    echo -e "${warning}WARNING: nvdiffrast GL plugin build failed. OpenGL rasterization will not work.${reset}"
+fi
+cd "${COMFY_ROOT}"
+echo ""
+
+# Now patch the installed ops.py to restore the GL context and dispatch logic.
+echo -e "${yellow}Patching nvdiffrast ops.py to restore OpenGL rasterizer support...${reset}"
+NVDR_OPS="${NVDR_INSTALLED}/torch/ops.py"
+
+$PYTHON_EXE << PYEOF
+import re
+
+with open("${NVDR_OPS}", "r") as f:
+    content = f.read()
+
+# 1. Add import for the pre-built GL plugin (after existing imports)
+gl_imports = '''
+import importlib
+import logging
+
+# Pre-built GL plugin for OpenGL rasterizer (from v0.3.5 sources)
+_gl_plugin = None
+def _get_gl_plugin():
+    global _gl_plugin
+    if _gl_plugin is not None:
+        return _gl_plugin
+    try:
+        import nvdiffrast_plugin_gl
+        _gl_plugin = nvdiffrast_plugin_gl
+    except ImportError:
+        raise RuntimeError(
+            "nvdiffrast GL plugin not found. "
+            "The OpenGL rasterizer requires the nvdiffrast_plugin_gl extension. "
+            "Please rebuild with the ROCm install script."
+        )
+    return _gl_plugin
+'''
+
+# Insert after the existing imports
+content = content.replace('import _nvdiffrast_c', 'import _nvdiffrast_c' + gl_imports)
+
+# 2. Replace the stub RasterizeGLContext with a real one
+old_gl_class = re.compile(
+    r'class RasterizeGLContext\(RasterizeCudaContext\):.*?(?=\n#[-]+|\nclass |\Z)',
+    re.DOTALL
+)
+new_gl_class = '''class RasterizeGLContext:
+    def __init__(self, output_db=True, mode='automatic', device=None):
+        assert output_db is True or output_db is False
+        assert mode in ['automatic', 'manual']
+        self.output_db = output_db
+        self.mode = mode
+        if device is None:
+            cuda_device_idx = torch.cuda.current_device()
+        else:
+            with torch.cuda.device(device):
+                cuda_device_idx = torch.cuda.current_device()
+        self.cpp_wrapper = _get_gl_plugin().RasterizeGLStateWrapper(output_db, mode == 'automatic', cuda_device_idx)
+        self.active_depth_peeler = None
+
+    def set_context(self):
+        assert self.mode == 'manual'
+        self.cpp_wrapper.set_context()
+
+    def release_context(self):
+        assert self.mode == 'manual'
+        self.cpp_wrapper.release_context()
+
+'''
+content = old_gl_class.sub(new_gl_class, content)
+
+# 3. Patch _rasterize_func.forward to dispatch GL vs CUDA
+old_forward = '''    def forward(ctx, raster_ctx, pos, tri, resolution, ranges, grad_db, peeling_idx):
+        out, out_db = _nvdiffrast_c.rasterize_fwd_cuda(raster_ctx.cpp_wrapper, pos, tri, resolution, ranges, peeling_idx)'''
+new_forward = '''    def forward(ctx, raster_ctx, pos, tri, resolution, ranges, grad_db, peeling_idx):
+        if isinstance(raster_ctx, RasterizeGLContext):
+            out, out_db = _get_gl_plugin().rasterize_fwd_gl(raster_ctx.cpp_wrapper, pos, tri, resolution, ranges, peeling_idx)
+        else:
+            out, out_db = _nvdiffrast_c.rasterize_fwd_cuda(raster_ctx.cpp_wrapper, pos, tri, resolution, ranges, peeling_idx)'''
+content = content.replace(old_forward, new_forward)
+
+# 4. Patch the rasterize() function to accept both context types
+content = content.replace(
+    'assert isinstance(glctx, RasterizeCudaContext)',
+    'assert isinstance(glctx, (RasterizeGLContext, RasterizeCudaContext))'
+)
+
+# 5. Add output_db handling for GL context (v0.4.0 removed it)
+content = content.replace(
+    '''    assert grad_db is True or grad_db is False
+
+    # Sanitize inputs.''',
+    '''    assert grad_db is True or grad_db is False
+    grad_db = grad_db and getattr(glctx, 'output_db', True)
+
+    # Sanitize inputs.'''
+)
+
+with open("${NVDR_OPS}", "w") as f:
+    f.write(content)
+
+print("ops.py patched successfully")
+PYEOF
+
+# Clear bytecode cache so the patched ops.py is used
+find "${NVDR_INSTALLED}" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 echo ""
 
 # --- nvdiffrec_render (patched for ROCm/HIP) ---

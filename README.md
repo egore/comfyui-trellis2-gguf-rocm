@@ -77,6 +77,10 @@ The GL rasterizer plugin is rebuilt from source with all CUDA/HIP-GL interop rem
 ### o-voxel / cubvh
 - Ensures Eigen submodule is properly cloned
 
+## Related Projects
+
+- [trellis-mac](https://github.com/shivampkumar/trellis-mac) — A port of TRELLIS.2 to **Apple Silicon** via PyTorch MPS. Replaces CUDA dependencies with Metal backends (`mtlgemm`, `mtldiffrast`) and pure-Python fallbacks. Standalone CLI, no ComfyUI. Unfortunately no `rocmgemm` or `rocmdiffrast` equivalents exist for AMD GPUs.
+
 ## Workflow Notes
 
 The GGUF variant uses node names with a `_GGUF` suffix (e.g. `Trellis2SimplifyMesh_GGUF`). If loading workflows built for the original (non-GGUF) Trellis2 plugin, you'll need to append `_GGUF` to the node type names in the workflow JSON.

@@ -50,9 +50,18 @@ The original Trellis2 GGUF nodes depend on several CUDA-only C++ extensions. The
 - Casts warp sync masks to 64-bit (ROCm 7.2 requirement)
 - Removes `-lineinfo` NVCC flag
 - Removes the `cudaraster` module (uses NVIDIA PTX assembly) and provides runtime stubs — the **OpenGL rasterizer** (`RasterizeGLContext`) still works
-- Rewrites `framework.h` with conditional HIP/CUDA includes and `NVDR_CHECK` macros
+- Rewrites `framework.h` with minimal CUDA→HIP type/function mappings (no GL interop types needed)
 - Fixes `uint64_t` narrowing (clang is stricter than NVCC)
 - Renames `.cpp` → `.cu` so `hipcc` compiles files that need CUDA→HIP header translation
+
+#### GL plugin (CPU-bounce path)
+The GL rasterizer plugin is rebuilt from source with all CUDA/HIP-GL interop removed (Mesa's open-source AMD driver doesn't support `hipGraphicsGLRegisterBuffer`). Data transfer uses a CPU-bounce approach instead:
+- **Upload** (GPU→GL): `hipMemcpy D2H` → `glBufferSubData`
+- **Readback** (GL→GPU): `glGetTexImage` → `hipMemcpy H2D`
+- `glutil.h` / `glutil.cpp` — rewritten for **EGL** surfaceless context creation (headless, no X11 dependency)
+- `rasterize_gl.cpp` — fully rewritten: staging buffer helper, CPU-bounce in `rasterizeRender`, `rasterizeCopyResults`, `rasterizeReleaseBuffers`
+- `rasterize_gl.h` — `cudaGraphicsResource_t` members replaced with `cpuStagingBuffer` / `cpuStagingSize`
+- Links `GL`, `EGL`, `amdhip64` (not GLX/X11)
 
 ### nvdiffrec_render
 - Removes `-lcuda -lnvrtc` linker flags

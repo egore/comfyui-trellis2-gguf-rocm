@@ -429,17 +429,319 @@ sed -i 's|#include <cuda_runtime.h>|#if defined(__HIP_PLATFORM_AMD__)\n#include 
 # Patch common.h: replace cuda.h with hip equivalent
 sed -i 's|#include <cuda.h>|#if defined(__HIP_PLATFORM_AMD__)\n#include <hip/hip_runtime.h>\n#else\n#include <cuda.h>\n#endif|' "${NVDR_GL}/common/common.h"
 
-# Patch glutil.h: remove cuda_gl_interop.h (not used — CPU bounce path),
-# add GL_READ_FRAMEBUFFER, add #undef GL_VERSION_3_0 for new extension functions.
-sed -i 's|#include <cuda_gl_interop.h>|// HIP-GL interop not used — CPU bounce transfers instead.|' "${NVDR_GL}/common/glutil.h"
-# Add GL_READ_FRAMEBUFFER constant after GL_FRAMEBUFFER
-sed -i '/#define GL_FRAMEBUFFER 0x8D40/a #endif\n#ifndef GL_READ_FRAMEBUFFER\n#define GL_READ_FRAMEBUFFER 0x8CA8' "${NVDR_GL}/common/glutil.h"
-# Add GL_VERSION_3_0 undef for glFramebufferTextureLayer
-sed -i 's|#undef GL_VERSION_3_2|#undef GL_VERSION_3_0\n#undef GL_VERSION_3_2|' "${NVDR_GL}/common/glutil.h"
+# Replace glutil.h: EGL context struct, no cuda_gl_interop.h, add needed GL constants
+cat > "${NVDR_GL}/common/glutil.h" << 'GLUTILHEOF'
+#pragma once
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#define GLAPIENTRY APIENTRY
+struct GLContext { HDC hdc; HGLRC hglrc; int extInitialized; };
+#endif
+#ifdef __linux__
+#define EGL_NO_X11
+#define MESA_EGL_NO_X11_HEADERS
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#define GL_GLEXT_LEGACY
+#define GLAPIENTRY
+struct GLContext { EGLDisplay display; EGLContext context; int extInitialized; };
+#endif
+#include <GL/gl.h>
+// HIP-GL interop not used — CPU bounce transfers instead.
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+#ifndef GL_TEXTURE_3D
+#define GL_TEXTURE_3D 0x806F
+#endif
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_DYNAMIC_DRAW
+#define GL_DYNAMIC_DRAW 0x88E8
+#endif
+#ifndef GL_ELEMENT_ARRAY_BUFFER
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#endif
+#ifndef GL_FRAGMENT_SHADER
+#define GL_FRAGMENT_SHADER 0x8B30
+#endif
+#ifndef GL_INFO_LOG_LENGTH
+#define GL_INFO_LOG_LENGTH 0x8B84
+#endif
+#ifndef GL_LINK_STATUS
+#define GL_LINK_STATUS 0x8B82
+#endif
+#ifndef GL_VERTEX_SHADER
+#define GL_VERTEX_SHADER 0x8B31
+#endif
+#ifndef GL_MAJOR_VERSION
+#define GL_MAJOR_VERSION 0x821B
+#endif
+#ifndef GL_MINOR_VERSION
+#define GL_MINOR_VERSION 0x821C
+#endif
+#ifndef GL_RGBA32F
+#define GL_RGBA32F 0x8814
+#endif
+#ifndef GL_TEXTURE_2D_ARRAY
+#define GL_TEXTURE_2D_ARRAY 0x8C1A
+#endif
+#ifndef GL_GEOMETRY_SHADER
+#define GL_GEOMETRY_SHADER 0x8DD9
+#endif
+#ifndef GL_COLOR_ATTACHMENT0
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#endif
+#ifndef GL_COLOR_ATTACHMENT1
+#define GL_COLOR_ATTACHMENT1 0x8CE1
+#endif
+#ifndef GL_DEPTH_STENCIL
+#define GL_DEPTH_STENCIL 0x84F9
+#endif
+#ifndef GL_DEPTH_STENCIL_ATTACHMENT
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
+#endif
+#ifndef GL_DEPTH24_STENCIL8
+#define GL_DEPTH24_STENCIL8 0x88F0
+#endif
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER 0x8D40
+#endif
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#endif
+#ifndef GL_INVALID_FRAMEBUFFER_OPERATION
+#define GL_INVALID_FRAMEBUFFER_OPERATION 0x0506
+#endif
+#ifndef GL_UNSIGNED_INT_24_8
+#define GL_UNSIGNED_INT_24_8 0x84FA
+#endif
+#ifndef GL_TABLE_TOO_LARGE
+#define GL_TABLE_TOO_LARGE 0x8031
+#endif
+#ifndef GL_CONTEXT_LOST
+#define GL_CONTEXT_LOST 0x0507
+#endif
+#undef GL_VERSION_1_5
+#undef GL_VERSION_2_0
+#undef GL_VERSION_3_0
+#undef GL_VERSION_3_2
+#undef GL_ARB_framebuffer_object
+#undef GL_ARB_vertex_array_object
+#undef GL_ARB_multi_draw_indirect
+#define GLUTIL_EXT(return_type, name, ...) extern return_type (GLAPIENTRY* name)(__VA_ARGS__);
+#include "glutil_extlist.h"
+#undef GLUTIL_EXT
+void setGLContext(GLContext& glctx);
+void releaseGLContext(void);
+GLContext createGLContext(int cudaDeviceIdx);
+void destroyGLContext(GLContext& glctx);
+const char* getGLErrorString(GLenum err);
+GLUTILHEOF
 
-# Patch glutil_extlist.h: add glBufferSubData and glFramebufferTextureLayer
-sed -i '/GLUTIL_EXT(void,   glGenBuffers,/i GLUTIL_EXT(void,   glBufferSubData,             GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data);' "${NVDR_GL}/common/glutil_extlist.h"
-sed -i '/#ifndef GL_VERSION_3_2/i #ifndef GL_VERSION_3_0\nGLUTIL_EXT(void,   glFramebufferTextureLayer,   GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);\n#endif' "${NVDR_GL}/common/glutil_extlist.h"
+# Replace glutil.cpp: EGL surfaceless context creation for ROCm/Mesa (headless, no X11)
+cat > "${NVDR_GL}/common/glutil.cpp" << 'GLUTILCPPEOF'
+#include "framework.h"
+#include "glutil.h"
+#include <iostream>
+#include <iomanip>
+#include <cstring>
+#define GLUTIL_EXT(return_type, name, ...) return_type (GLAPIENTRY* name)(__VA_ARGS__) = 0;
+#include "glutil_extlist.h"
+#undef GLUTIL_EXT
+static volatile bool s_glExtInitialized = false;
+const char* getGLErrorString(GLenum err)
+{
+    switch(err)
+    {
+        case GL_NO_ERROR:                       return "GL_NO_ERROR";
+        case GL_INVALID_ENUM:                   return "GL_INVALID_ENUM";
+        case GL_INVALID_VALUE:                  return "GL_INVALID_VALUE";
+        case GL_INVALID_OPERATION:              return "GL_INVALID_OPERATION";
+        case GL_STACK_OVERFLOW:                 return "GL_STACK_OVERFLOW";
+        case GL_STACK_UNDERFLOW:                return "GL_STACK_UNDERFLOW";
+        case GL_OUT_OF_MEMORY:                  return "GL_OUT_OF_MEMORY";
+        case GL_INVALID_FRAMEBUFFER_OPERATION:  return "GL_INVALID_FRAMEBUFFER_OPERATION";
+        case GL_TABLE_TOO_LARGE:                return "GL_TABLE_TOO_LARGE";
+        case GL_CONTEXT_LOST:                   return "GL_CONTEXT_LOST";
+    }
+    return "Unknown error";
+}
+#ifdef __linux__
+static pthread_mutex_t s_getProcAddressMutex = PTHREAD_MUTEX_INITIALIZER;
+typedef void (*PROCFN)();
+static void safeGetProcAddress(const char* name, PROCFN* pfn)
+{
+    PROCFN result = (PROCFN)eglGetProcAddress(name);
+    if (!result)
+    {
+        pthread_mutex_unlock(&s_getProcAddressMutex);
+        LOG(FATAL) << "eglGetProcAddress() failed for '" << name << "'";
+        exit(1);
+    }
+    *pfn = result;
+}
+static void initializeGLExtensions(void)
+{
+    pthread_mutex_lock(&s_getProcAddressMutex);
+    if (!s_glExtInitialized)
+    {
+#define GLUTIL_EXT(return_type, name, ...) safeGetProcAddress(#name, (PROCFN*)&name);
+#include "glutil_extlist.h"
+#undef GLUTIL_EXT
+        s_glExtInitialized = true;
+    }
+    pthread_mutex_unlock(&s_getProcAddressMutex);
+}
+void setGLContext(GLContext& glctx)
+{
+    if (!glctx.context)
+        LOG(FATAL) << "setGLContext() called with null context";
+    if (!eglMakeCurrent(glctx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, glctx.context))
+        LOG(ERROR) << "eglMakeCurrent() failed when setting GL context";
+    if (glctx.extInitialized)
+        return;
+    initializeGLExtensions();
+    glctx.extInitialized = 1;
+}
+void releaseGLContext(void)
+{
+    EGLDisplay display = eglGetCurrentDisplay();
+    if (display == EGL_NO_DISPLAY)
+        return;
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
+GLContext createGLContext(int cudaDeviceIdx)
+{
+    LOG(INFO) << "Creating EGL context for HIP device " << cudaDeviceIdx;
+    typedef EGLBoolean (*eglQueryDevicesEXT_t)(EGLint, EGLDeviceEXT*, EGLint*);
+    typedef EGLDisplay (*eglGetPlatformDisplayEXT_t)(EGLenum, void*, const EGLint*);
+    eglQueryDevicesEXT_t pQueryDevices = (eglQueryDevicesEXT_t)eglGetProcAddress("eglQueryDevicesEXT");
+    eglGetPlatformDisplayEXT_t pGetPlatformDisplay = (eglGetPlatformDisplayEXT_t)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    EGLDisplay display = EGL_NO_DISPLAY;
+    if (pQueryDevices && pGetPlatformDisplay)
+    {
+        EGLint numDevices = 0;
+        pQueryDevices(0, 0, &numDevices);
+        if (numDevices > 0)
+        {
+            EGLDeviceEXT* devices = (EGLDeviceEXT*)malloc(numDevices * sizeof(EGLDeviceEXT));
+            pQueryDevices(numDevices, devices, &numDevices);
+            int idx = (cudaDeviceIdx >= 0 && cudaDeviceIdx < numDevices) ? cudaDeviceIdx : 0;
+            display = pGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, devices[idx], 0);
+            LOG(INFO) << "EGL: found " << numDevices << " devices, using device " << idx;
+            free(devices);
+        }
+    }
+    if (display == EGL_NO_DISPLAY)
+    {
+        display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        LOG(INFO) << "EGL: using default display";
+    }
+    if (display == EGL_NO_DISPLAY)
+        LOG(FATAL) << "eglGetDisplay() failed";
+    EGLint major, minor;
+    if (!eglInitialize(display, &major, &minor))
+        LOG(FATAL) << "eglInitialize() failed";
+    LOG(INFO) << "EGL version: " << major << "." << minor;
+    if (!eglBindAPI(EGL_OPENGL_API))
+        LOG(FATAL) << "eglBindAPI(EGL_OPENGL_API) failed - desktop OpenGL not supported?";
+    static const EGLint configAttribs[] = {
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_RED_SIZE,        8,
+        EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,       8,
+        EGL_ALPHA_SIZE,      8,
+        EGL_DEPTH_SIZE,      24,
+        EGL_STENCIL_SIZE,    8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0)
+        LOG(FATAL) << "eglChooseConfig() failed";
+    static const EGLint ctxAttribs[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 4,
+        EGL_CONTEXT_MINOR_VERSION, 4,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_NONE
+    };
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+    if (context == EGL_NO_CONTEXT)
+        LOG(FATAL) << "eglCreateContext() failed (error 0x" << std::hex << eglGetError() << ")";
+    LOG(INFO) << "EGL OpenGL context created successfully";
+    GLContext glctx = {display, context, 0};
+    return glctx;
+}
+void destroyGLContext(GLContext& glctx)
+{
+    if (!glctx.context) LOG(FATAL) << "destroyGLContext() called with null context";
+    if (eglGetCurrentContext() == glctx.context) releaseGLContext();
+    eglDestroyContext(glctx.display, glctx.context);
+    LOG(INFO) << "EGL OpenGL context destroyed";
+    memset(&glctx, 0, sizeof(GLContext));
+}
+#endif // __linux__
+GLUTILCPPEOF
+
+# Replace glutil_extlist.h: add glBufferSubData and glFramebufferTextureLayer
+cat > "${NVDR_GL}/common/glutil_extlist.h" << 'EXTLISTEOF'
+// Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+//
+// NVIDIA CORPORATION and its licensors retain all intellectual property
+// and proprietary rights in and to this software, related documentation
+// and any modifications thereto.  Any use, reproduction, disclosure or
+// distribution of this software and related documentation without an express
+// license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+#ifndef GL_VERSION_1_2
+GLUTIL_EXT(void,   glTexImage3D,                GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels);
+#endif
+#ifndef GL_VERSION_1_5
+GLUTIL_EXT(void,   glBindBuffer,                GLenum target, GLuint buffer);
+GLUTIL_EXT(void,   glBufferData,                GLenum target, ptrdiff_t size, const void* data, GLenum usage);
+GLUTIL_EXT(void,   glBufferSubData,             GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data);
+GLUTIL_EXT(void,   glGenBuffers,                GLsizei n, GLuint* buffers);
+#endif
+#ifndef GL_VERSION_2_0
+GLUTIL_EXT(void,   glAttachShader,              GLuint program, GLuint shader);
+GLUTIL_EXT(void,   glCompileShader,             GLuint shader);
+GLUTIL_EXT(GLuint, glCreateProgram,             void);
+GLUTIL_EXT(GLuint, glCreateShader,              GLenum type);
+GLUTIL_EXT(void,   glDrawBuffers,               GLsizei n, const GLenum* bufs);
+GLUTIL_EXT(void,   glEnableVertexAttribArray,   GLuint index);
+GLUTIL_EXT(void,   glGetProgramInfoLog,         GLuint program, GLsizei bufSize, GLsizei* length, char* infoLog);
+GLUTIL_EXT(void,   glGetProgramiv,              GLuint program, GLenum pname, GLint* param);
+GLUTIL_EXT(void,   glLinkProgram,               GLuint program);
+GLUTIL_EXT(void,   glShaderSource,              GLuint shader, GLsizei count, const char *const* string, const GLint* length);
+GLUTIL_EXT(void,   glUniform1f,                 GLint location, GLfloat v0);
+GLUTIL_EXT(void,   glUniform2f,                 GLint location, GLfloat v0, GLfloat v1);
+GLUTIL_EXT(void,   glUseProgram,                GLuint program);
+GLUTIL_EXT(void,   glVertexAttribPointer,       GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void* pointer);
+#endif
+#ifndef GL_VERSION_3_0
+GLUTIL_EXT(void,   glFramebufferTextureLayer,   GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer);
+#endif
+#ifndef GL_VERSION_3_2
+GLUTIL_EXT(void,   glFramebufferTexture,        GLenum target, GLenum attachment, GLuint texture, GLint level);
+#endif
+#ifndef GL_ARB_framebuffer_object
+GLUTIL_EXT(void,   glBindFramebuffer,           GLenum target, GLuint framebuffer);
+GLUTIL_EXT(void,   glGenFramebuffers,           GLsizei n, GLuint* framebuffers);
+#endif
+#ifndef GL_ARB_vertex_array_object
+GLUTIL_EXT(void,   glBindVertexArray,           GLuint array);
+GLUTIL_EXT(void,   glGenVertexArrays,           GLsizei n, GLuint* arrays);
+#endif
+#ifndef GL_ARB_multi_draw_indirect
+GLUTIL_EXT(void,   glMultiDrawElementsIndirect, GLenum mode, GLenum type, const void *indirect, GLsizei primcount, GLsizei stride);
+#endif
+
+//------------------------------------------------------------------------
+EXTLISTEOF
 
 # Patch framework.h: CUDA→HIP aliases for CPU-bounce path (no GL interop types needed)
 cat > "${NVDR_GL}/common/framework.h" << 'FWGLEOF'
@@ -1181,7 +1483,7 @@ setup(
                 '/opt/rocm/include',
             ],
             define_macros=[('NVDR_TORCH', None), ('__HIP_PLATFORM_AMD__', '1')],
-            libraries=['GL', 'GLX', 'X11', 'amdhip64'],
+            libraries=['GL', 'EGL', 'amdhip64'],
             library_dirs=['/opt/rocm/lib'],
         ),
     ],
